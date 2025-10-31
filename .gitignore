@@ -1,5 +1,6 @@
-scripts/docs/
-sample_documents/
+docqa/scripts/docs/
+docqa/scripts/results/
+docqa/sample_documents/
 .DS_store
 
 # Byte-compiled / optimized / DLL files

@@ -11,5 +11,8 @@ addict
 easydict
 git+https://github.com/rednote-hilab/dots.ocr.git@master#egg=dots-ocr
 olmocr>=0.4.0
+
 Pillow
-setuptools
+pymupdf
+python-docx
+mlx-vlm

@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 authors = [
-    { name = "rafal01010", email = "dave.ramirez@eee.upd.edu.ph" }
+    { name = "rafal01010" }
 ]
 requires-python = ">=3.13"
 dependencies = [
@@ -12,8 +12,11 @@ dependencies = [
     "dots-ocr",
     "easydict>=1.13",
     "einops>=0.8.1",
+    "mlx-vlm>=0.3.5",
     "olmocr>=0.4.0",
     "pillow>=11.3.0",
+    "pymupdf>=1.26.5",
+    "python-docx>=1.2.0",
     "setuptools>=80.9.0",
     "tokenizers>=0.22.1",
     "torch==2.7.0",
