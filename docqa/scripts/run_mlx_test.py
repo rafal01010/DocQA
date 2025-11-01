@@ -32,33 +32,29 @@ def _discover_default_input(sample_dir: Path = DEFAULT_SAMPLE_DIR) -> Optional[P
     return candidates[0] if candidates else None
 
 
-def _prompt_user_for_output(target: Path) -> Path:
+def _prompt_user_for_output(target: Path) -> Tuple[Path, bool]:
     if not target.exists():
         target.mkdir(parents=True, exist_ok=True)
-        return target
+        return target, False
 
     while True:
         response = input(
             f"Output directory '{target}' already exists. "
-            "Overwrite [O] / keep both [K]? (default: O): "
+            "Skip existing [S] / overwrite [O]? (default: S): "
         ).strip().lower()
 
-        if response in {"", "o", "overwrite"}:
+        if response in {"", "s", "skip", "skip existing"}:
+            print(
+                "Existing output will be preserved; only missing pages will be generated."
+            )
+            return target, True
+
+        if response in {"o", "overwrite"}:
             shutil.rmtree(target)
             target.mkdir(parents=True, exist_ok=True)
-            return target
+            return target, False
 
-        if response in {"k", "keep", "keep both"}:
-            counter = 1
-            while True:
-                candidate = target.parent / f"{target.name}_{counter}"
-                if not candidate.exists():
-                    candidate.mkdir(parents=True, exist_ok=True)
-                    print(f"Writing output to '{candidate}'.")
-                    return candidate
-                counter += 1
-
-        print("Please respond with 'o' to overwrite or 'k' to keep both.")
+        print("Please respond with 's' to skip existing files or 'o' to overwrite.")
 
 
 def _import_mlx_stack():
@@ -323,9 +319,20 @@ def main() -> None:
         help="Largest allowed image dimension before downscaling for the VLM.",
     )
     parser.add_argument(
+        "--page-limit",
+        type=int,
+        default=1,
+        help="Maximum number of pages to process (ignored when --all-pages is set).",
+    )
+    parser.add_argument(
         "--all-pages",
         action="store_true",
-        help="Process every PDF page. Defaults to only the first page.",
+        help="Process every PDF page. Overrides --page-limit.",
+    )
+    parser.add_argument(
+        "--save-images",
+        action="store_true",
+        help="Also export each rendered PDF page as a PNG alongside the Markdown output.",
     )
 
     args = parser.parse_args()
@@ -347,9 +354,13 @@ def main() -> None:
     else:
         output_dir = results_root / f"{input_path.stem}_olmocr_pages"
     output_dir = output_dir.resolve()
-    output_dir = _prompt_user_for_output(output_dir)
+    output_dir, skip_existing = _prompt_user_for_output(output_dir)
 
-    page_limit = None if args.all_pages else 2
+    if not args.all_pages and args.page_limit < 1:
+        print("--page-limit must be at least 1 when --all-pages is not provided.", file=sys.stderr)
+        sys.exit(1)
+
+    page_limit = None if args.all_pages else args.page_limit
 
     try:
         images = _render_pdf_to_images(input_path, dpi=args.dpi, page_limit=page_limit)
@@ -393,35 +404,92 @@ def main() -> None:
 
     prompt_text = _build_prompt()
 
-    for page_idx, image in enumerate(images, start=1):
-        print(f"[{page_idx}/{len(images)}] Processing page...", flush=True)
-        image, resized, original_size = _downscale_for_vlm(image, max_side=args.max_side)
-        if resized:
-            print(
-                f"  -> Downscaled page image from {original_size[0]}x{original_size[1]} "
-                f"to {image.width}x{image.height}"
-            )
-        try:
-            markdown = _generate_markdown_page(
-                model=model,
-                processor=processor,
-                config=config,
-                apply_template_fn=apply_template,
-                generate_fn=mlx_generate,
-                image=image,
-                prompt_text=prompt_text,
-                max_tokens=args.max_tokens,
-                temperature=args.temperature,
-            )
-        except Exception as exc:
-            print(f"Failed to generate output for page {page_idx}: {exc}", file=sys.stderr)
-            break
+    for page_idx, page_image in enumerate(images, start=1):
+        markdown_file = output_dir / f"{input_path.stem}_page_{page_idx:03d}.md"
+        image_file: Optional[Path] = (
+            output_dir / f"{input_path.stem}_page_{page_idx:03d}.png" if args.save_images else None
+        )
 
-        output_file = output_dir / f"{input_path.stem}_page_{page_idx:03d}.md"
-        if markdown and not markdown.endswith("\n"):
-            markdown += "\n"
-        output_file.write_text(markdown, encoding="utf-8")
-        print(f"  -> Wrote {output_file.name}")
+        markdown_exists = markdown_file.exists()
+        image_exists = image_file.exists() if image_file else False
+
+        skip_page_entirely = (
+            skip_existing
+            and markdown_exists
+            and (not image_file or image_exists)
+        )
+        if skip_page_entirely:
+            if image_file:
+                print(
+                    f"[{page_idx}/{len(images)}] Skipping existing output "
+                    f"({markdown_file.name}, {image_file.name}).",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[{page_idx}/{len(images)}] Skipping existing output ({markdown_file.name}).",
+                    flush=True,
+                )
+            continue
+
+        should_generate_markdown = not (skip_existing and markdown_exists)
+        if should_generate_markdown:
+            print(f"[{page_idx}/{len(images)}] Processing page...", flush=True)
+        else:
+            print(
+                f"[{page_idx}/{len(images)}] Updating page artifacts (markdown already present)...",
+                flush=True,
+            )
+
+        image_for_model = page_image
+        resized = False
+        original_size = (page_image.width, page_image.height)
+        if should_generate_markdown:
+            image_for_model, resized, original_size = _downscale_for_vlm(
+                page_image, max_side=args.max_side
+            )
+            if resized:
+                print(
+                    f"  -> Downscaled page image from {original_size[0]}x{original_size[1]} "
+                    f"to {image_for_model.width}x{image_for_model.height}"
+                )
+
+        markdown: Optional[str] = None
+        if should_generate_markdown:
+            try:
+                markdown = _generate_markdown_page(
+                    model=model,
+                    processor=processor,
+                    config=config,
+                    apply_template_fn=apply_template,
+                    generate_fn=mlx_generate,
+                    image=image_for_model,
+                    prompt_text=prompt_text,
+                    max_tokens=args.max_tokens,
+                    temperature=args.temperature,
+                )
+            except Exception as exc:
+                print(f"Failed to generate output for page {page_idx}: {exc}", file=sys.stderr)
+                break
+
+        if should_generate_markdown:
+            if markdown and not markdown.endswith("\n"):
+                markdown += "\n"
+            markdown_file.write_text(markdown, encoding="utf-8")
+            print(f"  -> Wrote {markdown_file.name}")
+        else:
+            print(f"  -> Markdown already exists; reusing {markdown_file.name}")
+
+        if image_file:
+            should_save_image = not (skip_existing and image_exists)
+            if should_save_image:
+                page_image_to_save = (
+                    page_image if page_image.mode == "RGB" else page_image.convert("RGB")
+                )
+                page_image_to_save.save(image_file, format="PNG")
+                print(f"  -> Wrote {image_file.name}")
+            else:
+                print(f"  -> Image already exists; reusing {image_file.name}")
 
 
 if __name__ == "__main__":
