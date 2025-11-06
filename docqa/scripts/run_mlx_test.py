@@ -1,260 +1,69 @@
 #!/usr/bin/env python3
 """
-Quick test harness for running olmOCR-2 (MLX weights) against a sample PDF document.
+Generic MLX VLM test harness that renders a PDF and produces Markdown per page.
 
-- Prefers the locally cached `/Users/dave/models/olmOCR-2-7B-1025-4bit` folder,
-  but falls back to the specified Hugging Face repo when the local path is missing.
+- Defaults to the locally cached `/Users/dave/models/olmOCR-2-7B-1025-4bit` weights,
+  but will fall back to the specified Hugging Face repo when the local path is missing.
 - Uses `mlx_vlm` utilities so the model runs with Apple MLX acceleration (MPS/ANE).
-- Accepts a PDF input and writes one Markdown file per page.
+- Auto-selects model-specific helpers (e.g. prompts) based on the model identifier.
 """
 from __future__ import annotations
 
 import argparse
-import io
-import shutil
+import re
 import sys
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Callable, Optional, Sequence, Tuple
 
-from PIL import Image
+from utils.general import (
+    discover_default_input,
+    downscale_for_vlm,
+    generate_markdown_page,
+    import_mlx_stack,
+    prompt_user_for_output,
+    render_pdf_to_images,
+    resolve_model_path,
+)
+from utils.olmocr import build_olmocr_markdown_prompt
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_SAMPLE_DIR = SCRIPT_DIR.parent / "sample_documents"
 DEFAULT_MODEL_ROOT = Path("/Users/dave/AI/models")
 DEFAULT_MODEL_NAME = "olmOCR-2-7B-1025-4bit"
 DEFAULT_HF_FALLBACK = "mlx-community/olmOCR-2-7B-1025-4bit"
+DEFAULT_PROMPT = (
+    "You are a meticulous OCR assistant. Transcribe the provided document page into "
+    "well-formatted Markdown that preserves headings, lists, and tables when possible. "
+    "Do not include commentary outside the transcription."
+)
+
+PROMPT_REGISTRY: Sequence[Tuple[str, Callable[[], str]]] = (
+    ("olmocr", build_olmocr_markdown_prompt),
+)
 
 
-def _discover_default_input(sample_dir: Path = DEFAULT_SAMPLE_DIR) -> Optional[Path]:
-    if not sample_dir.exists():
-        return None
-    candidates = sorted(path for path in sample_dir.iterdir() if path.suffix.lower() == ".pdf")
-    return candidates[0] if candidates else None
+def slugify(value: str) -> str:
+    cleaned = re.sub(r"[^\w]+", "_", value or "")
+    cleaned = cleaned.strip("_").lower()
+    return cleaned or "model"
 
 
-def _prompt_user_for_output(target: Path) -> Tuple[Path, bool]:
-    if not target.exists():
-        target.mkdir(parents=True, exist_ok=True)
-        return target, False
-
-    while True:
-        response = input(
-            f"Output directory '{target}' already exists. "
-            "Skip existing [S] / overwrite [O]? (default: S): "
-        ).strip().lower()
-
-        if response in {"", "s", "skip", "skip existing"}:
-            print(
-                "Existing output will be preserved; only missing pages will be generated."
-            )
-            return target, True
-
-        if response in {"o", "overwrite"}:
-            shutil.rmtree(target)
-            target.mkdir(parents=True, exist_ok=True)
-            return target, False
-
-        print("Please respond with 's' to skip existing files or 'o' to overwrite.")
-
-
-def _import_mlx_stack():
-    try:
-        import mlx.core as mx  # noqa: F401
-        from mlx_vlm import generate as mlx_generate
-        from mlx_vlm import load as mlx_load
-        from mlx_vlm.prompt_utils import apply_chat_template as mlx_apply_chat_template
-        from mlx_vlm.utils import load_config as mlx_load_config
-    except ImportError as exc:
-        raise RuntimeError(
-            "MLX vision-language dependencies are missing. "
-            "Install them with `pip install mlx mlx_vlm`."
-        ) from exc
-    return mlx_load, mlx_generate, mlx_apply_chat_template, mlx_load_config
-
-
-def _resolve_model_path(
-    model_root: Path, model_name: str, hf_fallback: Optional[str]
-) -> Tuple[str, bool, Path]:
-    rooted = model_root.expanduser().resolve()
-    local_candidate = rooted / model_name
-    if local_candidate.exists():
-        return str(local_candidate), True, local_candidate
-
-    fallback = (hf_fallback or model_name).strip()
-    if "/" not in fallback and not Path(fallback).expanduser().exists():
-        fallback = f"mlx-community/{fallback}"
-    return fallback, False, local_candidate
-
-
-def _downscale_for_vlm(
-    img: Image.Image, max_side: int = 1280
-) -> Tuple[Image.Image, bool, Tuple[int, int]]:
-    original_size = (img.width, img.height)
-    if img.mode != "RGB":
-        img = img.convert("RGB")
-    max_dim = max(original_size)
-    if max_dim <= max_side:
-        return img, False, original_size
-    scale = max_side / float(max_dim)
-    new_width = max(1, int(original_size[0] * scale))
-    new_height = max(1, int(original_size[1] * scale))
-    resized = img.resize((new_width, new_height), Image.BILINEAR)
-    return resized, True, original_size
-
-
-def _render_pdf_to_images(pdf_path: Path, dpi: int, page_limit: Optional[int] = None) -> List[Image.Image]:
-    try:
-        import fitz  # PyMuPDF
-    except ImportError as exc:
-        raise RuntimeError(
-            "PyMuPDF is required for PDF rendering. Install it with `pip install pymupdf`."
-        ) from exc
-
-    images: List[Image.Image] = []
-    zoom = dpi / 72.0
-    matrix = fitz.Matrix(zoom, zoom)
-
-    with fitz.open(pdf_path) as pdf_doc:
-        for page_index, page in enumerate(pdf_doc, start=1):
-            if page_limit is not None and page_index > page_limit:
-                break
-            pix = page.get_pixmap(matrix=matrix, alpha=False)
-            with io.BytesIO(pix.tobytes("png")) as buffer:
-                image = Image.open(buffer)
-                image.load()
-                images.append(image.convert("RGB"))
-    return images
-
-
-def _build_prompt() -> str:
-    try:
-        from olmocr.prompts import build_no_anchoring_v4_yaml_prompt
-    except ImportError:
-        return (
-            "You are a meticulous OCR assistant. Transcribe the provided document page into "
-            "well-formatted Markdown that preserves headings, lists, and tables when possible. "
-            "Do not include commentary outside the transcription."
-        )
-    return build_no_anchoring_v4_yaml_prompt()
-
-
-def _extract_text(result: Any) -> str:
-    text_attr = getattr(result, "text", None)
-    if isinstance(text_attr, str):
-        return text_attr
-
-    generated_attr = getattr(result, "generated_text", None)
-    if isinstance(generated_attr, str):
-        return generated_attr
-
-    outputs_attr = getattr(result, "outputs", None)
-    if isinstance(outputs_attr, (list, tuple)) and outputs_attr:
-        first = outputs_attr[0]
-        if isinstance(first, str):
-            return first
-        if isinstance(first, dict):
-            for key in ("generated_text", "text", "output"):
-                value = first.get(key)
-                if isinstance(value, str):
-                    return value
-        nested_text = getattr(first, "text", None)
-        if isinstance(nested_text, str):
-            return nested_text
-
-    choices_attr = getattr(result, "choices", None)
-    if isinstance(choices_attr, (list, tuple)) and choices_attr:
-        first = choices_attr[0]
-        if isinstance(first, dict):
-            for key in ("text", "message", "generated_text"):
-                value = first.get(key)
-                if isinstance(value, str):
-                    return value
-                if isinstance(value, dict):
-                    content_value = value.get("content")
-                    if isinstance(content_value, str):
-                        return content_value
-        choice_text = getattr(first, "text", None)
-        if isinstance(choice_text, str):
-            return choice_text
-
-    if hasattr(result, "to_dict"):
-        try:
-            result_dict = result.to_dict()
-        except Exception:
-            result_dict = None
-        if isinstance(result_dict, dict):
-            for key in ("generated_text", "text", "output"):
-                value = result_dict.get(key)
-                if isinstance(value, str):
-                    return value
-
-    if isinstance(result, str):
-        return result
-    if isinstance(result, (list, tuple)):
-        if not result:
-            return ""
-        first = result[0]
-        if isinstance(first, str):
-            return first
-        if isinstance(first, dict):
-            for key in ("generated_text", "text", "output"):
-                value = first.get(key)
-                if isinstance(value, str):
-                    return value
-        return str(first)
-    if isinstance(result, dict):
-        for key in ("generated_text", "text", "output"):
-            value = result.get(key)
-            if isinstance(value, str):
-                return value
-    return str(result)
-
-
-def _clean_generated_markdown(text: str) -> str:
-    if not text:
-        return ""
-
-    normalized = text.replace("\\n", "\n")
-    lines = normalized.splitlines()
-    if len(lines) >= 8:
-        lines = lines[8:]
-    else:
-        lines = []
-
-    cleaned = "\n".join(lines).strip()
-    return cleaned
-
-
-def _generate_markdown_page(
-    model: Any,
-    processor: Any,
-    config: Any,
-    apply_template_fn: Callable[..., str],
-    generate_fn: Callable[..., Any],
-    image: Image.Image,
-    prompt_text: str,
-    max_tokens: Optional[int],
-    temperature: Optional[float],
-) -> str:
-    formatted_prompt = apply_template_fn(processor, config, prompt_text, num_images=1)
-    result = generate_fn(
-        model,
-        processor,
-        formatted_prompt,
-        [image],
-        verbose=False,
-        max_tokens=max_tokens,
-        temperature=temperature,
-    )
-    print(result)
-    return _clean_generated_markdown(_extract_text(result))
+def resolve_prompt_text(*identifiers: str) -> str:
+    for identifier in identifiers:
+        if not identifier:
+            continue
+        lowered = identifier.lower()
+        for keyword, builder in PROMPT_REGISTRY:
+            if keyword in lowered:
+                return builder()
+    return DEFAULT_PROMPT
 
 
 def main() -> None:
-    default_input = _discover_default_input()
+    default_input = discover_default_input(DEFAULT_SAMPLE_DIR)
 
     parser = argparse.ArgumentParser(
-        description="Run local/remote MLX olmOCR-2 inference on a PDF and export Markdown per page."
+        description="Run local/remote MLX VLM inference on a PDF and export Markdown per page."
     )
     parser.add_argument(
         "--input",
@@ -352,9 +161,10 @@ def main() -> None:
             args.output_dir if args.output_dir.is_absolute() else results_root / args.output_dir
         )
     else:
-        output_dir = results_root / f"{input_path.stem}_olmocr_pages"
+        model_slug = slugify(args.model_name or DEFAULT_MODEL_NAME)
+        output_dir = results_root / f"{input_path.stem}_{model_slug}_pages"
     output_dir = output_dir.resolve()
-    output_dir, skip_existing = _prompt_user_for_output(output_dir)
+    output_dir, skip_existing = prompt_user_for_output(output_dir)
 
     if not args.all_pages and args.page_limit < 1:
         print("--page-limit must be at least 1 when --all-pages is not provided.", file=sys.stderr)
@@ -363,7 +173,7 @@ def main() -> None:
     page_limit = None if args.all_pages else args.page_limit
 
     try:
-        images = _render_pdf_to_images(input_path, dpi=args.dpi, page_limit=page_limit)
+        images = render_pdf_to_images(input_path, dpi=args.dpi, page_limit=page_limit)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(1)
@@ -373,12 +183,12 @@ def main() -> None:
         sys.exit(1)
 
     try:
-        mlx_load, mlx_generate, apply_template, load_config = _import_mlx_stack()
+        mlx_load, mlx_generate, apply_template, load_config = import_mlx_stack()
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(1)
 
-    model_path, used_local, local_candidate = _resolve_model_path(
+    model_path, used_local, local_candidate = resolve_model_path(
         args.model_root, args.model_name, args.hf_path
     )
     if not used_local:
@@ -402,7 +212,7 @@ def main() -> None:
         print(f"Failed to load MLX model config from '{model_path}': {exc}", file=sys.stderr)
         sys.exit(1)
 
-    prompt_text = _build_prompt()
+    prompt_text = resolve_prompt_text(args.model_name, model_path)
 
     for page_idx, page_image in enumerate(images, start=1):
         markdown_file = output_dir / f"{input_path.stem}_page_{page_idx:03d}.md"
@@ -445,7 +255,7 @@ def main() -> None:
         resized = False
         original_size = (page_image.width, page_image.height)
         if should_generate_markdown:
-            image_for_model, resized, original_size = _downscale_for_vlm(
+            image_for_model, resized, original_size = downscale_for_vlm(
                 page_image, max_side=args.max_side
             )
             if resized:
@@ -457,7 +267,7 @@ def main() -> None:
         markdown: Optional[str] = None
         if should_generate_markdown:
             try:
-                markdown = _generate_markdown_page(
+                markdown = generate_markdown_page(
                     model=model,
                     processor=processor,
                     config=config,

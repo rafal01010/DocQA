@@ -2,6 +2,7 @@ docqa/scripts/docs/
 docqa/scripts/results/
 docqa/sample_documents/
 .DS_store
+.vscode/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
