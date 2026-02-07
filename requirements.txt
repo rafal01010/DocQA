@@ -1,0 +1,15 @@
+# Shared dependency set for local OCR/VLM experiments.
+# Install with `uv add -r requirements.txt`.
+
+torch==2.7.0
+torchvision==0.22.0
+torchaudio==2.7.0
+transformers>=4.57.6
+tokenizers
+einops
+addict
+easydict
+Pillow
+pymupdf
+python-docx
+mlx-vlm
